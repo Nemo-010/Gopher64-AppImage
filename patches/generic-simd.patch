@@ -23,40 +23,42 @@ index 1fe243b..2f64d26 100644
  [env]
  CC = "clang"
 diff --git a/build.rs b/build.rs
-index 103c6c9..66e4471 100644
+index 103c6c9..51ac633 100644
 --- a/build.rs
 +++ b/build.rs
 @@ -118,20 +118,26 @@ fn main() {
  
      let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
      let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+-    let opt_flag = if arch == "x86_64" {
+-        "-march=x86-64-v3"
 +    // Build the C sources for the same floor as the Rust code: Core 2 Duo on
 +    // x86-64, and the aarch64 baseline on Linux.
-     let opt_flag = if arch == "x86_64" {
--        "-march=x86-64-v3"
-+        "-march=x86-64 -mssse3"
++    let opt_flags: &[&str] = if arch == "x86_64" {
++        &["-march=x86-64", "-mssse3"]
      } else if arch == "aarch64" && os == "macos" {
-         "-march=armv8.4-a"
+-        "-march=armv8.4-a"
 -    } else if arch == "aarch64" && os != "macos" {
 -        "-march=armv8.2-a"
++        &["-march=armv8.4-a"]
 +    } else if arch == "aarch64" {
-+        "-march=armv8-a"
++        &["-march=armv8-a"]
      } else {
 -        panic!("unknown arch")
 +        // riscv64, loongarch64 and ppc64 are already at their baseline, and
 +        // naming it would mean knowing which extensions the port builds for.
-+        ""
++        &[]
      };
  
 -    volk_build.flag(opt_flag);
 -    rdp_build.flag(opt_flag);
 -    simd_build.flag(opt_flag);
 -    retroachievements_build.flag(opt_flag);
-+    if !opt_flag.is_empty() {
-+        volk_build.flag(opt_flag);
-+        rdp_build.flag(opt_flag);
-+        simd_build.flag(opt_flag);
-+        retroachievements_build.flag(opt_flag);
++    for flag in opt_flags {
++        volk_build.flag(flag);
++        rdp_build.flag(flag);
++        simd_build.flag(flag);
++        retroachievements_build.flag(flag);
 +    }
  
      if os == "windows" {

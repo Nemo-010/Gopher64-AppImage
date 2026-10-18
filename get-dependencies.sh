@@ -8,7 +8,8 @@ echo "Installing package dependencies..."
 echo "---------------------------------------------------------------"
 # gopher64 vendors SDL3 and the Vulkan headers, so a compiler, cmake and ninja
 # are enough to build them. llvm supplies llvm-ar, which .cargo/config.toml sets
-# as the archiver, and lld is the linker it asks for on aarch64.
+# as the archiver, and lld is the linker it asks for on aarch64. fontconfig is
+# there for the fontconfig-sys crate, which looks for it with pkg-config.
 #
 # rust comes from the repositories rather than from rustup: rustup has no
 # loongarch64 toolchain it can download from inside the build containers, and
@@ -18,6 +19,7 @@ pacman -Syu --noconfirm \
 	base-devel \
 	clang      \
 	cmake      \
+	fontconfig \
 	git        \
 	lld        \
 	llvm       \
