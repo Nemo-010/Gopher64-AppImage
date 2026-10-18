@@ -1,0 +1,17 @@
+nix 0.26 only lists the architectures it knew about when it was released, so on
+loongarch64 neither consts module is compiled and the build fails. The ioctl
+numbers follow the generic layout there, the same as on the other 64-bit
+little endian targets.
+
+--- a/src/sys/ioctl/linux.rs
++++ b/src/sys/ioctl/linux.rs
+@@ -42,7 +42,8 @@
+     target_arch = "x86_64",
+     target_arch = "aarch64",
+     target_arch = "riscv32",
+-    target_arch = "riscv64"
++    target_arch = "riscv64",
++    target_arch = "loongarch64"
+ ))]
+ mod consts {
+     #[doc(hidden)]

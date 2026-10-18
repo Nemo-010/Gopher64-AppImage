@@ -57,7 +57,20 @@ git clone "$REPO" ./gopher64 && (
 	# riscv64, loongarch64 and ppc64 are missing.
 	git apply -p1 ../patches/generic-simd.patch
 
-	cargo build --release --locked $CARGO_FLAGS
+	# nix 0.26, pulled in by webrtc-util for netplay, predates loongarch64 and
+	# does not compile there. Vendor it with the missing architecture added.
+	if [ "$ARCH" = loongarch64 ]; then
+		cargo fetch --locked
+		cp -r "$(find /root/.cargo/registry/src -maxdepth 2 -type d -name 'nix-0.26.4' | head -1)" \
+			../vendor-nix
+		chmod -R u+w ../vendor-nix
+		patch -d ../vendor-nix -p1 < ../patches/nix-loongarch64.patch
+		printf '\n[patch.crates-io]\nnix = { path = "../vendor-nix" }\n' >> Cargo.toml
+		# the patch section changes the lockfile, so it can no longer be used
+		CARGO_FLAGS="$CARGO_FLAGS --offline"
+	fi
+
+	cargo build --release $CARGO_FLAGS
 	mkdir -p ../AppDir/bin
 	mv -v ./target/release/gopher64 ../AppDir/bin
 )
