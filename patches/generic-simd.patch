@@ -1,0 +1,1178 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index 1fe243b..2f64d26 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -8,7 +8,9 @@ linker = "rust-lld"
+ rustflags = ["-C", "link-arg=/STACK:8388608"]
+ 
+ [target.'cfg(target_arch = "x86_64")']
+-rustflags = ["-C", "target-cpu=x86-64-v3"]
++# Core 2 Duo and newer: the baseline plus SSSE3, which is what the RSP cores
++# need for pshufb. The SSE4.1 intrinsics are handled in src/compat/x86_64.rs.
++rustflags = ["-C", "target-cpu=x86-64", "-C", "target-feature=+ssse3"]
+ 
+ [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))']
+ rustflags = [
+@@ -17,7 +19,7 @@ rustflags = [
+ ]
+ 
+ [target.'cfg(all(target_arch = "aarch64", not(target_os = "macos")))']
+-rustflags = ["-C", "target-cpu=cortex-a76"]
++rustflags = ["-C", "target-cpu=generic"]
+ 
+ [env]
+ CC = "clang"
+diff --git a/build.rs b/build.rs
+index 103c6c9..66e4471 100644
+--- a/build.rs
++++ b/build.rs
+@@ -118,20 +118,26 @@ fn main() {
+ 
+     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
++    // Build the C sources for the same floor as the Rust code: Core 2 Duo on
++    // x86-64, and the aarch64 baseline on Linux.
+     let opt_flag = if arch == "x86_64" {
+-        "-march=x86-64-v3"
++        "-march=x86-64 -mssse3"
+     } else if arch == "aarch64" && os == "macos" {
+         "-march=armv8.4-a"
+-    } else if arch == "aarch64" && os != "macos" {
+-        "-march=armv8.2-a"
++    } else if arch == "aarch64" {
++        "-march=armv8-a"
+     } else {
+-        panic!("unknown arch")
++        // riscv64, loongarch64 and ppc64 are already at their baseline, and
++        // naming it would mean knowing which extensions the port builds for.
++        ""
+     };
+ 
+-    volk_build.flag(opt_flag);
+-    rdp_build.flag(opt_flag);
+-    simd_build.flag(opt_flag);
+-    retroachievements_build.flag(opt_flag);
++    if !opt_flag.is_empty() {
++        volk_build.flag(opt_flag);
++        rdp_build.flag(opt_flag);
++        simd_build.flag(opt_flag);
++        retroachievements_build.flag(opt_flag);
++    }
+ 
+     if os == "windows" {
+         volk_build.flag("-DVK_USE_PLATFORM_WIN32_KHR");
+@@ -223,6 +229,15 @@ fn main() {
+         .write_to_file(out_path.join("parallel_bindings.rs"))
+         .expect("Couldn't write bindings!");
+ 
++    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
++        // The intrinsics these architectures are missing, implemented in plain
++        // C. src/compat/generic.rs declares the same functions.
++        cc::Build::new()
++            .std("c17")
++            .file("src/compat/generic.c")
++            .compile("simd");
++    }
++
+     if arch == "aarch64" {
+         let simd_bindings = bindgen::Builder::default()
+             .header("src/compat/sse2neon/sse2neon.h")
+diff --git a/src/compat/generic.c b/src/compat/generic.c
+new file mode 100644
+index 0000000..048ffbf
+--- /dev/null
++++ b/src/compat/generic.c
+@@ -0,0 +1,502 @@
++// Portable implementations of the SSE2/SSSE3/SSE4.1 intrinsics that gopher64
++// uses, for architectures that have neither the x86_64 intrinsics nor NEON
++// (riscv64, loongarch64, ppc64le and ppc64).
++//
++// The emulator only needs 16-bit integer vector arithmetic plus a handful of
++// byte shuffles, so plain C is enough to make those ports work. Lanes are
++// addressed by their byte offset inside the 128-bit value, exactly like the
++// x86 intrinsics do, and multi-byte lanes are read and written little endian,
++// so the result does not depend on the byte order of the host.
++//
++// The value crosses the FFI boundary as a struct of two uint64_t. That is an
++// aggregate of two integer eightbytes on every ABI in question, which is the
++// least surprising thing to pass by value; vector types are not, and they are
++// also passed in vector registers on some of them.
++
++#include <stdint.h>
++#include <string.h>
++
++typedef struct {
++    uint64_t v[2];
++} g64_m128i;
++
++static inline uint16_t g64_rd16(const uint8_t *p) {
++    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++static inline void g64_wr16(uint8_t *p, uint16_t v) {
++    p[0] = (uint8_t)v;
++    p[1] = (uint8_t)(v >> 8);
++}
++
++static inline uint32_t g64_rd32(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++           ((uint32_t)p[3] << 24);
++}
++
++static inline void g64_wr32(uint8_t *p, uint32_t v) {
++    p[0] = (uint8_t)v;
++    p[1] = (uint8_t)(v >> 8);
++    p[2] = (uint8_t)(v >> 16);
++    p[3] = (uint8_t)(v >> 24);
++}
++
++static inline uint64_t g64_rd64(const uint8_t *p) {
++    return (uint64_t)g64_rd32(p) | ((uint64_t)g64_rd32(p + 4) << 32);
++}
++
++static inline void g64_wr64(uint8_t *p, uint64_t v) {
++    g64_wr32(p, (uint32_t)v);
++    g64_wr32(p + 4, (uint32_t)(v >> 32));
++}
++
++static inline int16_t g64_rd16s(const uint8_t *p) {
++    return (int16_t)g64_rd16(p);
++}
++
++static inline void g64_wr16s(uint8_t *p, int16_t v) {
++    g64_wr16(p, (uint16_t)v);
++}
++
++static inline int32_t g64_rd32s(const uint8_t *p) {
++    return (int32_t)g64_rd32(p);
++}
++
++static inline void g64_wr32s(uint8_t *p, int32_t v) {
++    g64_wr32(p, (uint32_t)v);
++}
++
++static inline int16_t g64_sat16(int32_t v) {
++    if (v > INT16_MAX) {
++        return INT16_MAX;
++    }
++    if (v < INT16_MIN) {
++        return INT16_MIN;
++    }
++    return (int16_t)v;
++}
++
++static inline uint16_t g64_satu16(int32_t v) {
++    if (v > UINT16_MAX) {
++        return UINT16_MAX;
++    }
++    if (v < 0) {
++        return 0;
++    }
++    return (uint16_t)v;
++}
++
++static inline void g64_in(const g64_m128i *x, uint8_t *out) {
++    memcpy(out, x->v, 16);
++}
++
++static inline g64_m128i g64_out(const uint8_t *in) {
++    g64_m128i r;
++    memcpy(r.v, in, 16);
++    return r;
++}
++
++g64_m128i g64_mm_setzero_si128(void) {
++    g64_m128i r;
++    r.v[0] = 0;
++    r.v[1] = 0;
++    return r;
++}
++
++g64_m128i g64_mm_set1_epi8(int8_t a) {
++    uint8_t r[16];
++    memset(r, (uint8_t)a, sizeof(r));
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_set1_epi16(int16_t a) {
++    uint8_t r[16];
++    for (int i = 0; i < 8; i++) {
++        g64_wr16s(r + i * 2, a);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_set1_epi32(int32_t a) {
++    uint8_t r[16];
++    for (int i = 0; i < 4; i++) {
++        g64_wr32s(r + i * 4, a);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_set_epi8(int8_t e15, int8_t e14, int8_t e13, int8_t e12, int8_t e11,
++                          int8_t e10, int8_t e9, int8_t e8, int8_t e7, int8_t e6,
++                          int8_t e5, int8_t e4, int8_t e3, int8_t e2, int8_t e1,
++                          int8_t e0) {
++    const uint8_t r[16] = {(uint8_t)e0,  (uint8_t)e1,  (uint8_t)e2,  (uint8_t)e3,
++                           (uint8_t)e4,  (uint8_t)e5,  (uint8_t)e6,  (uint8_t)e7,
++                           (uint8_t)e8,  (uint8_t)e9,  (uint8_t)e10, (uint8_t)e11,
++                           (uint8_t)e12, (uint8_t)e13, (uint8_t)e14, (uint8_t)e15};
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_set_epi16(int16_t e7, int16_t e6, int16_t e5, int16_t e4, int16_t e3,
++                           int16_t e2, int16_t e1, int16_t e0) {
++    uint8_t r[16];
++    g64_wr16s(r + 0, e0);
++    g64_wr16s(r + 2, e1);
++    g64_wr16s(r + 4, e2);
++    g64_wr16s(r + 6, e3);
++    g64_wr16s(r + 8, e4);
++    g64_wr16s(r + 10, e5);
++    g64_wr16s(r + 12, e6);
++    g64_wr16s(r + 14, e7);
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_add_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, (uint16_t)(g64_rd16(av + i) + g64_rd16(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_sub_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, (uint16_t)(g64_rd16(av + i) - g64_rd16(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_adds_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16s(r + i, g64_sat16((int32_t)g64_rd16s(av + i) + g64_rd16s(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_adds_epu16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, g64_satu16((int32_t)g64_rd16(av + i) + g64_rd16(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_subs_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16s(r + i, g64_sat16((int32_t)g64_rd16s(av + i) - g64_rd16s(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_subs_epu16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, g64_satu16((int32_t)g64_rd16(av + i) - g64_rd16(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_mullo_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, (uint16_t)((uint32_t)g64_rd16(av + i) * g64_rd16(bv + i)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_mulhi_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        int32_t product = (int32_t)g64_rd16s(av + i) * g64_rd16s(bv + i);
++        g64_wr16(r + i, (uint16_t)((uint32_t)product >> 16));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_mulhi_epu16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        uint32_t product = (uint32_t)g64_rd16(av + i) * g64_rd16(bv + i);
++        g64_wr16(r + i, (uint16_t)(product >> 16));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_and_si128(g64_m128i a, g64_m128i b) {
++    g64_m128i r;
++    r.v[0] = a.v[0] & b.v[0];
++    r.v[1] = a.v[1] & b.v[1];
++    return r;
++}
++
++g64_m128i g64_mm_andnot_si128(g64_m128i a, g64_m128i b) {
++    g64_m128i r;
++    r.v[0] = ~a.v[0] & b.v[0];
++    r.v[1] = ~a.v[1] & b.v[1];
++    return r;
++}
++
++g64_m128i g64_mm_or_si128(g64_m128i a, g64_m128i b) {
++    g64_m128i r;
++    r.v[0] = a.v[0] | b.v[0];
++    r.v[1] = a.v[1] | b.v[1];
++    return r;
++}
++
++g64_m128i g64_mm_xor_si128(g64_m128i a, g64_m128i b) {
++    g64_m128i r;
++    r.v[0] = a.v[0] ^ b.v[0];
++    r.v[1] = a.v[1] ^ b.v[1];
++    return r;
++}
++
++g64_m128i g64_mm_cmpeq_epi8(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i++) {
++        r[i] = av[i] == bv[i] ? 0xFF : 0x00;
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_cmpeq_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, g64_rd16(av + i) == g64_rd16(bv + i) ? 0xFFFF : 0x0000);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_cmpgt_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, g64_rd16s(av + i) > g64_rd16s(bv + i) ? 0xFFFF : 0x0000);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_cmplt_epi16(g64_m128i a, g64_m128i b) {
++    return g64_mm_cmpgt_epi16(b, a);
++}
++
++g64_m128i g64_mm_min_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        int16_t x = g64_rd16s(av + i);
++        int16_t y = g64_rd16s(bv + i);
++        g64_wr16s(r + i, x < y ? x : y);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_max_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 16; i += 2) {
++        int16_t x = g64_rd16s(av + i);
++        int16_t y = g64_rd16s(bv + i);
++        g64_wr16s(r + i, x > y ? x : y);
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_unpacklo_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 4; i++) {
++        g64_wr16(r + i * 4, g64_rd16(av + i * 2));
++        g64_wr16(r + i * 4 + 2, g64_rd16(bv + i * 2));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_unpackhi_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 4; i++) {
++        g64_wr16(r + i * 4, g64_rd16(av + 8 + i * 2));
++        g64_wr16(r + i * 4 + 2, g64_rd16(bv + 8 + i * 2));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_packs_epi16(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 8; i++) {
++        int16_t v = g64_rd16s(av + i * 2);
++        r[i] = (uint8_t)(v > INT8_MAX ? INT8_MAX : (v < INT8_MIN ? INT8_MIN : v));
++    }
++    for (int i = 0; i < 8; i++) {
++        int16_t v = g64_rd16s(bv + i * 2);
++        r[8 + i] = (uint8_t)(v > INT8_MAX ? INT8_MAX : (v < INT8_MIN ? INT8_MIN : v));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_packs_epi32(g64_m128i a, g64_m128i b) {
++    uint8_t av[16], bv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    for (int i = 0; i < 4; i++) {
++        g64_wr16s(r + i * 2, g64_sat16(g64_rd32s(av + i * 4)));
++    }
++    for (int i = 0; i < 4; i++) {
++        g64_wr16s(r + 8 + i * 2, g64_sat16(g64_rd32s(bv + i * 4)));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_shuffle_epi8(g64_m128i a, g64_m128i mask) {
++    uint8_t av[16], mv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&mask, mv);
++    for (int i = 0; i < 16; i++) {
++        r[i] = mv[i] & 0x80 ? 0x00 : av[mv[i] & 0x0F];
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_blendv_epi8(g64_m128i a, g64_m128i b, g64_m128i mask) {
++    uint8_t av[16], bv[16], mv[16], r[16];
++    g64_in(&a, av);
++    g64_in(&b, bv);
++    g64_in(&mask, mv);
++    for (int i = 0; i < 16; i++) {
++        r[i] = mv[i] & 0x80 ? bv[i] : av[i];
++    }
++    return g64_out(r);
++}
++
++int32_t g64_mm_movemask_epi8(g64_m128i a) {
++    uint8_t av[16];
++    int32_t r = 0;
++    g64_in(&a, av);
++    for (int i = 0; i < 16; i++) {
++        r |= (int32_t)(av[i] >> 7) << i;
++    }
++    return r;
++}
++
++// The shifts take their count as an immediate in the x86 intrinsics. The
++// callers always pass a literal, but the C parameter is a plain int, so the
++// counts that x86 defines outside that range are handled here.
++
++g64_m128i g64_mm_srli_epi16(g64_m128i a, int imm8) {
++    uint8_t av[16], r[16];
++    g64_in(&a, av);
++    if (imm8 > 15) {
++        return g64_mm_setzero_si128();
++    }
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, (uint16_t)(g64_rd16(av + i) >> imm8));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_slli_epi16(g64_m128i a, int imm8) {
++    uint8_t av[16], r[16];
++    g64_in(&a, av);
++    if (imm8 > 15) {
++        return g64_mm_setzero_si128();
++    }
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16(r + i, (uint16_t)(g64_rd16(av + i) << imm8));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_srai_epi16(g64_m128i a, int imm8) {
++    uint8_t av[16], r[16];
++    g64_in(&a, av);
++    if (imm8 > 15) {
++        imm8 = 15;
++    }
++    for (int i = 0; i < 16; i += 2) {
++        g64_wr16s(r + i, (int16_t)(g64_rd16s(av + i) >> imm8));
++    }
++    return g64_out(r);
++}
++
++g64_m128i g64_mm_insert_epi8(g64_m128i a, int32_t i, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    av[imm8 & 15] = (uint8_t)i;
++    return g64_out(av);
++}
++
++int32_t g64_mm_extract_epi8(g64_m128i a, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    return (int32_t)av[imm8 & 15];
++}
++
++g64_m128i g64_mm_insert_epi16(g64_m128i a, int32_t i, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    g64_wr16(av + (imm8 & 7) * 2, (uint16_t)i);
++    return g64_out(av);
++}
++
++int32_t g64_mm_extract_epi16(g64_m128i a, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    return (int32_t)g64_rd16(av + (imm8 & 7) * 2);
++}
++
++g64_m128i g64_mm_insert_epi32(g64_m128i a, int32_t i, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    g64_wr32s(av + (imm8 & 3) * 4, i);
++    return g64_out(av);
++}
++
++int32_t g64_mm_extract_epi32(g64_m128i a, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    return g64_rd32s(av + (imm8 & 3) * 4);
++}
++
++g64_m128i g64_mm_insert_epi64(g64_m128i a, int64_t i, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    g64_wr64(av + (imm8 & 1) * 8, (uint64_t)i);
++    return g64_out(av);
++}
++
++int64_t g64_mm_extract_epi64(g64_m128i a, int imm8) {
++    uint8_t av[16];
++    g64_in(&a, av);
++    return (int64_t)g64_rd64(av + (imm8 & 1) * 8);
++}
+diff --git a/src/compat/generic.rs b/src/compat/generic.rs
+new file mode 100644
+index 0000000..97280f8
+--- /dev/null
++++ b/src/compat/generic.rs
+@@ -0,0 +1,134 @@
++// Rust side of src/compat/generic.c: the portable implementations of the SSE
++// intrinsics, for the architectures that have neither the x86_64 intrinsics nor
++// NEON (riscv64, loongarch64, ppc64le and ppc64).
++//
++// The signatures match the ones std::arch::x86_64 provides, so a caller only
++// has to change which module it globs.
++
++use crate::device::__m128i;
++
++unsafe extern "C" {
++    #[link_name = "g64_mm_setzero_si128"]
++    pub fn _mm_setzero_si128() -> __m128i;
++
++    #[link_name = "g64_mm_set1_epi8"]
++    pub fn _mm_set1_epi8(a: i8) -> __m128i;
++    #[link_name = "g64_mm_set1_epi16"]
++    pub fn _mm_set1_epi16(a: i16) -> __m128i;
++    #[link_name = "g64_mm_set1_epi32"]
++    pub fn _mm_set1_epi32(a: i32) -> __m128i;
++
++    #[link_name = "g64_mm_set_epi8"]
++    pub fn _mm_set_epi8(
++        e15: i8,
++        e14: i8,
++        e13: i8,
++        e12: i8,
++        e11: i8,
++        e10: i8,
++        e9: i8,
++        e8: i8,
++        e7: i8,
++        e6: i8,
++        e5: i8,
++        e4: i8,
++        e3: i8,
++        e2: i8,
++        e1: i8,
++        e0: i8,
++    ) -> __m128i;
++
++    #[link_name = "g64_mm_set_epi16"]
++    pub fn _mm_set_epi16(
++        e7: i16,
++        e6: i16,
++        e5: i16,
++        e4: i16,
++        e3: i16,
++        e2: i16,
++        e1: i16,
++        e0: i16,
++    ) -> __m128i;
++
++    #[link_name = "g64_mm_add_epi16"]
++    pub fn _mm_add_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_sub_epi16"]
++    pub fn _mm_sub_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_adds_epi16"]
++    pub fn _mm_adds_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_adds_epu16"]
++    pub fn _mm_adds_epu16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_subs_epi16"]
++    pub fn _mm_subs_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_subs_epu16"]
++    pub fn _mm_subs_epu16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_mullo_epi16"]
++    pub fn _mm_mullo_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_mulhi_epi16"]
++    pub fn _mm_mulhi_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_mulhi_epu16"]
++    pub fn _mm_mulhi_epu16(a: __m128i, b: __m128i) -> __m128i;
++
++    #[link_name = "g64_mm_and_si128"]
++    pub fn _mm_and_si128(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_andnot_si128"]
++    pub fn _mm_andnot_si128(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_or_si128"]
++    pub fn _mm_or_si128(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_xor_si128"]
++    pub fn _mm_xor_si128(a: __m128i, b: __m128i) -> __m128i;
++
++    #[link_name = "g64_mm_cmpeq_epi8"]
++    pub fn _mm_cmpeq_epi8(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_cmpeq_epi16"]
++    pub fn _mm_cmpeq_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_cmpgt_epi16"]
++    pub fn _mm_cmpgt_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_cmplt_epi16"]
++    pub fn _mm_cmplt_epi16(a: __m128i, b: __m128i) -> __m128i;
++
++    #[link_name = "g64_mm_min_epi16"]
++    pub fn _mm_min_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_max_epi16"]
++    pub fn _mm_max_epi16(a: __m128i, b: __m128i) -> __m128i;
++
++    #[link_name = "g64_mm_unpacklo_epi16"]
++    pub fn _mm_unpacklo_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_unpackhi_epi16"]
++    pub fn _mm_unpackhi_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_packs_epi16"]
++    pub fn _mm_packs_epi16(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_packs_epi32"]
++    pub fn _mm_packs_epi32(a: __m128i, b: __m128i) -> __m128i;
++
++    #[link_name = "g64_mm_shuffle_epi8"]
++    pub fn _mm_shuffle_epi8(a: __m128i, b: __m128i) -> __m128i;
++    #[link_name = "g64_mm_blendv_epi8"]
++    pub fn _mm_blendv_epi8(a: __m128i, b: __m128i, mask: __m128i) -> __m128i;
++    #[link_name = "g64_mm_movemask_epi8"]
++    pub fn _mm_movemask_epi8(a: __m128i) -> i32;
++
++    #[link_name = "g64_mm_srli_epi16"]
++    pub fn _mm_srli_epi16(a: __m128i, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_slli_epi16"]
++    pub fn _mm_slli_epi16(a: __m128i, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_srai_epi16"]
++    pub fn _mm_srai_epi16(a: __m128i, imm8: i32) -> __m128i;
++
++    #[link_name = "g64_mm_insert_epi8"]
++    pub fn _mm_insert_epi8(a: __m128i, i: i32, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_extract_epi8"]
++    pub fn _mm_extract_epi8(a: __m128i, imm8: i32) -> i32;
++    #[link_name = "g64_mm_insert_epi16"]
++    pub fn _mm_insert_epi16(a: __m128i, i: i32, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_extract_epi16"]
++    pub fn _mm_extract_epi16(a: __m128i, imm8: i32) -> i32;
++    #[link_name = "g64_mm_insert_epi32"]
++    pub fn _mm_insert_epi32(a: __m128i, i: i32, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_extract_epi32"]
++    pub fn _mm_extract_epi32(a: __m128i, imm8: i32) -> i32;
++    #[link_name = "g64_mm_insert_epi64"]
++    pub fn _mm_insert_epi64(a: __m128i, i: i64, imm8: i32) -> __m128i;
++    #[link_name = "g64_mm_extract_epi64"]
++    pub fn _mm_extract_epi64(a: __m128i, imm8: i32) -> i64;
++}
+diff --git a/src/compat/mod.rs b/src/compat/mod.rs
+new file mode 100644
+index 0000000..2d454ee
+--- /dev/null
++++ b/src/compat/mod.rs
+@@ -0,0 +1,14 @@
++// Per-architecture implementations of the vector intrinsics the emulation
++// cores use, for the architectures whose own intrinsics do not cover them.
++
++// x86_64 has the intrinsics, but seven of the ones the RSP cores call are
++// SSE4.1 rather than part of the baseline, so they are provided here with a run
++// time check.
++#[cfg(target_arch = "x86_64")]
++pub mod x86_64;
++
++// riscv64, loongarch64, ppc64le and ppc64 have neither the x86_64 intrinsics
++// nor NEON. src/compat/generic.c implements them in plain C, and generic.rs
++// declares the same functions.
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++pub mod generic;
+diff --git a/src/compat/x86_64.rs b/src/compat/x86_64.rs
+new file mode 100644
+index 0000000..7080761
+--- /dev/null
++++ b/src/compat/x86_64.rs
+@@ -0,0 +1,221 @@
++// A drop-in replacement for `use std::arch::x86_64::*` that also provides the
++// intrinsics the build's floor does not have.
++//
++// The floor is SSSE3, which Core 2 Duo has, so pshufb is available everywhere
++// and the re-export below is enough for it. Seven intrinsics the RSP cores call
++// are SSE4.1 instead: pblendvb, pinsrb, pextrb, pinsrd, pextrd, pinsrq and
++// pextrq. Each one here runs the real instruction when the CPU has SSE4.1 and
++// falls back to SSSE3 or plain lane access when it does not, so a Core 2 Duo
++// works and a Penryn or newer loses nothing.
++//
++// The definitions shadow the names re-exported from std, because an item in the
++// module takes precedence over one a glob brings in.
++
++pub use std::arch::x86_64::*;
++
++// is_x86_feature_detected caches its answer in an atomic, so the branch costs
++// about as much as the lane access it guards.
++
++#[inline]
++pub unsafe fn _mm_blendv_epi8(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { blendv_epi8_sse41(a, b, mask) }
++    } else {
++        unsafe { blendv_epi8_ssse3(a, b, mask) }
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn blendv_epi8_sse41(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
++    std::arch::x86_64::_mm_blendv_epi8(a, b, mask)
++}
++
++unsafe fn blendv_epi8_ssse3(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
++    unsafe {
++        // the choice is made per byte from the high bit of the mask, so a
++        // signed compare against zero gives the 0xff or 0x00 selector
++        let select_b = _mm_cmpgt_epi8(_mm_setzero_si128(), mask);
++        _mm_or_si128(_mm_andnot_si128(select_b, a), _mm_and_si128(select_b, b))
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_insert_epi8(a: __m128i, i: i32, imm8: i32) -> __m128i {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { insert_epi8_sse41(a, i, imm8) }
++    } else {
++        unsafe { insert_epi8_ssse3(a, i as u8, imm8) }
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_extract_epi8(a: __m128i, imm8: i32) -> i32 {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { extract_epi8_sse41(a, imm8) }
++    } else {
++        unsafe { extract_epi8_ssse3(a, imm8) }
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_insert_epi32(a: __m128i, i: i32, imm8: i32) -> __m128i {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { insert_epi32_sse41(a, i, imm8) }
++    } else {
++        unsafe { insert_epi32_ssse3(a, i, imm8) }
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_extract_epi32(a: __m128i, imm8: i32) -> i32 {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { extract_epi32_sse41(a, imm8) }
++    } else {
++        unsafe { extract_epi32_ssse3(a, imm8) }
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_insert_epi64(a: __m128i, i: i64, imm8: i32) -> __m128i {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { insert_epi64_sse41(a, i, imm8) }
++    } else {
++        unsafe { insert_epi64_ssse3(a, i, imm8) }
++    }
++}
++
++#[inline]
++pub unsafe fn _mm_extract_epi64(a: __m128i, imm8: i32) -> i64 {
++    if std::arch::is_x86_feature_detected!("sse4.1") {
++        unsafe { extract_epi64_sse41(a, imm8) }
++    } else {
++        unsafe { extract_epi64_ssse3(a, imm8) }
++    }
++}
++
++// The SSE4.1 versions take the lane as an immediate, hence the unrolled match.
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn insert_epi8_sse41(a: __m128i, i: i32, imm8: i32) -> __m128i {
++    match imm8 & 15 {
++        0 => std::arch::x86_64::_mm_insert_epi8(a, i, 0),
++        1 => std::arch::x86_64::_mm_insert_epi8(a, i, 1),
++        2 => std::arch::x86_64::_mm_insert_epi8(a, i, 2),
++        3 => std::arch::x86_64::_mm_insert_epi8(a, i, 3),
++        4 => std::arch::x86_64::_mm_insert_epi8(a, i, 4),
++        5 => std::arch::x86_64::_mm_insert_epi8(a, i, 5),
++        6 => std::arch::x86_64::_mm_insert_epi8(a, i, 6),
++        7 => std::arch::x86_64::_mm_insert_epi8(a, i, 7),
++        8 => std::arch::x86_64::_mm_insert_epi8(a, i, 8),
++        9 => std::arch::x86_64::_mm_insert_epi8(a, i, 9),
++        10 => std::arch::x86_64::_mm_insert_epi8(a, i, 10),
++        11 => std::arch::x86_64::_mm_insert_epi8(a, i, 11),
++        12 => std::arch::x86_64::_mm_insert_epi8(a, i, 12),
++        13 => std::arch::x86_64::_mm_insert_epi8(a, i, 13),
++        14 => std::arch::x86_64::_mm_insert_epi8(a, i, 14),
++        _ => std::arch::x86_64::_mm_insert_epi8(a, i, 15),
++    }
++}
++
++unsafe fn insert_epi8_ssse3(a: __m128i, i: u8, imm8: i32) -> __m128i {
++    unsafe {
++        let mut lanes: [u8; 16] = std::mem::transmute(a);
++        lanes[(imm8 & 15) as usize] = i;
++        std::mem::transmute(lanes)
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn extract_epi8_sse41(a: __m128i, imm8: i32) -> i32 {
++    match imm8 & 15 {
++        0 => std::arch::x86_64::_mm_extract_epi8(a, 0),
++        1 => std::arch::x86_64::_mm_extract_epi8(a, 1),
++        2 => std::arch::x86_64::_mm_extract_epi8(a, 2),
++        3 => std::arch::x86_64::_mm_extract_epi8(a, 3),
++        4 => std::arch::x86_64::_mm_extract_epi8(a, 4),
++        5 => std::arch::x86_64::_mm_extract_epi8(a, 5),
++        6 => std::arch::x86_64::_mm_extract_epi8(a, 6),
++        7 => std::arch::x86_64::_mm_extract_epi8(a, 7),
++        8 => std::arch::x86_64::_mm_extract_epi8(a, 8),
++        9 => std::arch::x86_64::_mm_extract_epi8(a, 9),
++        10 => std::arch::x86_64::_mm_extract_epi8(a, 10),
++        11 => std::arch::x86_64::_mm_extract_epi8(a, 11),
++        12 => std::arch::x86_64::_mm_extract_epi8(a, 12),
++        13 => std::arch::x86_64::_mm_extract_epi8(a, 13),
++        14 => std::arch::x86_64::_mm_extract_epi8(a, 14),
++        _ => std::arch::x86_64::_mm_extract_epi8(a, 15),
++    }
++}
++
++unsafe fn extract_epi8_ssse3(a: __m128i, imm8: i32) -> i32 {
++    unsafe {
++        let lanes: [u8; 16] = std::mem::transmute(a);
++        lanes[(imm8 & 15) as usize] as i32
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn insert_epi32_sse41(a: __m128i, i: i32, imm8: i32) -> __m128i {
++    match imm8 & 3 {
++        0 => std::arch::x86_64::_mm_insert_epi32(a, i, 0),
++        1 => std::arch::x86_64::_mm_insert_epi32(a, i, 1),
++        2 => std::arch::x86_64::_mm_insert_epi32(a, i, 2),
++        _ => std::arch::x86_64::_mm_insert_epi32(a, i, 3),
++    }
++}
++
++unsafe fn insert_epi32_ssse3(a: __m128i, i: i32, imm8: i32) -> __m128i {
++    unsafe {
++        let mut lanes: [i32; 4] = std::mem::transmute(a);
++        lanes[(imm8 & 3) as usize] = i;
++        std::mem::transmute(lanes)
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn extract_epi32_sse41(a: __m128i, imm8: i32) -> i32 {
++    match imm8 & 3 {
++        0 => std::arch::x86_64::_mm_extract_epi32(a, 0),
++        1 => std::arch::x86_64::_mm_extract_epi32(a, 1),
++        2 => std::arch::x86_64::_mm_extract_epi32(a, 2),
++        _ => std::arch::x86_64::_mm_extract_epi32(a, 3),
++    }
++}
++
++unsafe fn extract_epi32_ssse3(a: __m128i, imm8: i32) -> i32 {
++    unsafe {
++        let lanes: [i32; 4] = std::mem::transmute(a);
++        lanes[(imm8 & 3) as usize]
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn insert_epi64_sse41(a: __m128i, i: i64, imm8: i32) -> __m128i {
++    match imm8 & 1 {
++        0 => std::arch::x86_64::_mm_insert_epi64(a, i, 0),
++        _ => std::arch::x86_64::_mm_insert_epi64(a, i, 1),
++    }
++}
++
++unsafe fn insert_epi64_ssse3(a: __m128i, i: i64, imm8: i32) -> __m128i {
++    unsafe {
++        let mut lanes: [i64; 2] = std::mem::transmute(a);
++        lanes[(imm8 & 1) as usize] = i;
++        std::mem::transmute(lanes)
++    }
++}
++
++#[target_feature(enable = "sse4.1")]
++unsafe fn extract_epi64_sse41(a: __m128i, imm8: i32) -> i64 {
++    match imm8 & 1 {
++        0 => std::arch::x86_64::_mm_extract_epi64(a, 0),
++        _ => std::arch::x86_64::_mm_extract_epi64(a, 1),
++    }
++}
++
++unsafe fn extract_epi64_ssse3(a: __m128i, imm8: i32) -> i64 {
++    unsafe {
++        let lanes: [i64; 2] = std::mem::transmute(a);
++        lanes[(imm8 & 1) as usize]
++    }
++}
+diff --git a/src/device.rs b/src/device.rs
+index 7c17ed2..59fbe96 100644
+--- a/src/device.rs
++++ b/src/device.rs
+@@ -7,8 +7,34 @@
+ pub struct __m128i(std::arch::aarch64::int64x2_t);
+ #[cfg(target_arch = "aarch64")]
+ include!(concat!(env!("OUT_DIR"), "/simd_bindings.rs"));
++// The x86-64 build targets the baseline, which only guarantees SSE2, so the
++// seven SSE4.1 intrinsics the RSP cores call come from here instead.
+ #[cfg(target_arch = "x86_64")]
+-use std::arch::x86_64::*;
++use crate::compat::x86_64::*;
++// riscv64, loongarch64 and ppc64 have neither the x86_64 intrinsics nor NEON.
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++#[derive(Copy, Clone)]
++#[allow(dead_code)]
++#[repr(C)]
++pub struct __m128i {
++    limbs: [u64; 2],
++}
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use crate::compat::generic::*;
++
++// A vector is turned into a u128 through its bytes rather than with a
++// transmute: on a big endian host the transmute would pick the other end of the
++// 128 bits, and a savestate would then not carry the vector registers in the
++// same order as on the little endian builds.
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++pub fn m128i_from_u128(value: u128) -> __m128i {
++    unsafe { std::mem::transmute::<[u8; 16], __m128i>(value.to_le_bytes()) }
++}
++
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++pub fn m128i_to_u128(value: __m128i) -> u128 {
++    u128::from_le_bytes(unsafe { std::mem::transmute::<__m128i, [u8; 16]>(value) })
++}
+ 
+ const N64_EXTENSIONS_UNCOMPRESSED: [&str; 8] =
+     ["n64", "v64", "z64", "bin", "N64", "V64", "Z64", "BIN"];
+diff --git a/src/device/rsp_cpu.rs b/src/device/rsp_cpu.rs
+index 2ff0971..ae9aec6 100644
+--- a/src/device/rsp_cpu.rs
++++ b/src/device/rsp_cpu.rs
+@@ -4,7 +4,11 @@ use device::__m128i;
+ include!(concat!(env!("OUT_DIR"), "/simd_bindings.rs"));
+ use crate::{device, savestates};
+ #[cfg(target_arch = "x86_64")]
+-use std::arch::x86_64::*;
++use crate::compat::x86_64::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use crate::compat::generic::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use device::__m128i;
+ 
+ #[derive(Clone, serde::Serialize, serde::Deserialize)]
+ pub struct BranchState {
+diff --git a/src/device/rsp_su_instructions.rs b/src/device/rsp_su_instructions.rs
+index 4afc4c9..120244c 100644
+--- a/src/device/rsp_su_instructions.rs
++++ b/src/device/rsp_su_instructions.rs
+@@ -6,7 +6,11 @@ include!(concat!(env!("OUT_DIR"), "/simd_bindings.rs"));
+ include!("../compat/aarch64.rs");
+ use crate::device;
+ #[cfg(target_arch = "x86_64")]
+-use std::arch::x86_64::*;
++use crate::compat::x86_64::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use crate::compat::generic::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use device::__m128i;
+ 
+ fn rd(opcode: u32) -> u32 {
+     (opcode >> 11) & 0x1F
+@@ -171,11 +175,25 @@ fn get_vpr64(vpr: __m128i, element: u8) -> u64 {
+ }
+ 
+ fn modify_vpr128(vpr: &mut __m128i, value: u128) {
+-    unsafe { *vpr = std::mem::transmute::<u128, __m128i>(value) }
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++    unsafe {
++        *vpr = std::mem::transmute::<u128, __m128i>(value)
++    };
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    {
++        *vpr = device::m128i_from_u128(value);
++    }
+ }
+ 
+ fn get_vpr128(vpr: __m128i) -> u128 {
+-    unsafe { std::mem::transmute::<__m128i, u128>(vpr) }
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++    unsafe {
++        std::mem::transmute::<__m128i, u128>(vpr)
++    }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    {
++        device::m128i_to_u128(vpr)
++    }
+ }
+ 
+ pub fn j(device: &mut device::Device, opcode: u32) {
+diff --git a/src/device/rsp_vu_instructions.rs b/src/device/rsp_vu_instructions.rs
+index 4333daf..6fb6783 100644
+--- a/src/device/rsp_vu_instructions.rs
++++ b/src/device/rsp_vu_instructions.rs
+@@ -7,7 +7,11 @@ include!("../compat/aarch64.rs");
+ use crate::device;
+ use crate::device::rsp_su_instructions::{get_vpr16, modify_vpr16};
+ #[cfg(target_arch = "x86_64")]
+-use std::arch::x86_64::*;
++use crate::compat::x86_64::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use crate::compat::generic::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use device::__m128i;
+ 
+ fn vt(opcode: u32) -> u32 {
+     (opcode >> 16) & 0x1F
+diff --git a/src/lib.rs b/src/lib.rs
+index b3e51ae..7e221b9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,7 @@
+ #![deny(warnings)]
+ 
+ mod cheats;
++mod compat;
+ mod device;
+ mod netplay;
+ mod retroachievements;
+diff --git a/src/savestates.rs b/src/savestates.rs
+index 19342da..2ebf3e2 100644
+--- a/src/savestates.rs
++++ b/src/savestates.rs
+@@ -4,7 +4,11 @@ use device::__m128i;
+ use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
+ use serde::ser::{Serialize, SerializeSeq, Serializer};
+ #[cfg(target_arch = "x86_64")]
+-use std::arch::x86_64::*;
++use crate::compat::x86_64::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use crate::compat::generic::*;
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++use device::__m128i;
+ use std::ops::Deref;
+ 
+ struct M128iArrayVisitor<const N: usize>;
+@@ -23,7 +27,16 @@ impl<'de, const N: usize> Visitor<'de> for M128iArrayVisitor<N> {
+         let mut arr: [__m128i; N] = [device::zero_m128i(); N];
+         for (index, item) in arr.iter_mut().enumerate() {
+             match seq.next_element::<u128>()? {
+-                Some(value) => *item = unsafe { std::mem::transmute::<u128, __m128i>(value) },
++                Some(value) => {
++                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++                    {
++                        *item = unsafe { std::mem::transmute::<u128, __m128i>(value) };
++                    }
++                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++                    {
++                        *item = device::m128i_from_u128(value);
++                    }
++                }
+                 None => return Err(serde::de::Error::invalid_length(index, &self)),
+             }
+         }
+@@ -44,7 +57,10 @@ pub fn serialize_m128i<S>(data: &__m128i, serializer: S) -> Result<S::Ok, S::Err
+ where
+     S: Serializer,
+ {
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+     let bytes: u128 = unsafe { std::mem::transmute(*data) };
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    let bytes: u128 = device::m128i_to_u128(*data);
+     bytes.serialize(serializer)
+ }
+ 
+@@ -53,7 +69,14 @@ where
+     D: Deserializer<'de>,
+ {
+     let bytes = u128::deserialize(deserializer)?;
+-    Ok(unsafe { std::mem::transmute::<u128, __m128i>(bytes) })
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++    {
++        Ok(unsafe { std::mem::transmute::<u128, __m128i>(bytes) })
++    }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    {
++        Ok(device::m128i_from_u128(bytes))
++    }
+ }
+ 
+ pub fn serialize_m128i_array<S>(value: &[__m128i], serializer: S) -> Result<S::Ok, S::Error>
+@@ -63,7 +86,10 @@ where
+     let mut seq = serializer.serialize_seq(Some(value.len()))?;
+ 
+     for item in value {
++        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+         let bytes: u128 = unsafe { std::mem::transmute(*item) };
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++        let bytes: u128 = device::m128i_to_u128(*item);
+         seq.serialize_element(&bytes)?;
+     }
+ 

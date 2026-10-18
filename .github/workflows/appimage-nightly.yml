@@ -40,9 +40,42 @@ jobs:
           name: AppImage-${{ matrix.arch }}
           path: dist
 
+  # this part runs via QEMU so expect higher CI times
+  build-additional-cpu-arches:
+    if: true # set to true to build the below arches
+    name: "${{ matrix.name }} (${{ matrix.arch }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # comment out the arches that are not wanted
+          # note 'if: false' is set by default and these are all turned off
+          - { name: Build AppImage, arch: riscv64, platform: linux/riscv64 }
+          - { name: Build AppImage, arch: loongarch64, platform: linux/loong64 }
+          - { name: Build AppImage, arch: ppc64le, platform: linux/ppc64le }
+          - { name: Build AppImage, arch: ppc64, platform: linux/ppc64 } # BE
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build AppImage (emulated)
+        uses: pkgforge-dev/anylinux-setup-action/emulated@ba7321e11074f9e387a0634e653d09b115d576cd # v6
+        with:
+          platform: ${{ matrix.platform }}
+        env:
+          DEVEL_RELEASE: 1
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: AppImage-${{ matrix.arch }}
+          path: dist
+
   release:
-    if: ${{ github.ref_name == 'main' }}
-    needs: [build]
+    # !cancelled() lets a release happen if build-additional-cpu-arches is turned off
+    if: >-
+      ${{ !cancelled() && github.ref_name == 'main'
+      && needs.build.result == 'success'
+      && needs.build-additional-cpu-arches.result != 'failure' }}
+    needs: [build, build-additional-cpu-arches]
     permissions: write-all
     runs-on: ubuntu-latest
     steps:
