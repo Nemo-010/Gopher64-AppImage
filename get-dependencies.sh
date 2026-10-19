@@ -6,26 +6,39 @@ ARCH=$(uname -m)
 
 echo "Installing package dependencies..."
 echo "---------------------------------------------------------------"
-# gopher64 vendors SDL3 and the Vulkan headers, so a compiler, cmake and ninja
-# are enough to build them. llvm supplies llvm-ar, which .cargo/config.toml sets
-# as the archiver, and lld is the linker it asks for on aarch64. fontconfig is
-# there for the fontconfig-sys crate, which looks for it with pkg-config.
+# SDL3 is built from the copy gopher64 vendors, and it wants the X11, Wayland
+# and libdecor headers when it is configured, or cmake stops on a missing
+# XCURSOR. llvm supplies llvm-ar, which .cargo/config.toml sets as the archiver,
+# and lld is the linker it asks for on aarch64. fontconfig is there for the
+# fontconfig-sys crate, which looks for it with pkg-config.
 #
 # rust comes from the repositories rather than from rustup: rustup has no
 # loongarch64 toolchain it can download from inside the build containers, and
 # the ppc64 one it offers is ELFv1 while ArchPOWER is ELFv2. The repositories
 # have a rust for every architecture gopher64 is built for.
 pacman -Syu --noconfirm \
-	base-devel \
-	clang      \
-	cmake      \
-	fontconfig \
-	git        \
-	lld        \
-	llvm       \
-	ninja      \
-	patchelf   \
-	rust
+	base-devel          \
+	clang               \
+	cmake               \
+	fontconfig          \
+	git                 \
+	libdecor            \
+	libx11              \
+	libxext             \
+	libxkbcommon        \
+	libxcursor          \
+	libxfixes           \
+	libxi               \
+	libxrandr           \
+	libxss              \
+	lld                 \
+	llvm                \
+	ninja               \
+	patchelf            \
+	rust                \
+	wayland             \
+	wayland-protocols   \
+	xorgproto
 
 echo "Installing debloated packages..."
 echo "---------------------------------------------------------------"
